@@ -99,31 +99,34 @@ def get_coordinates_from_kakao(query):
     return None, None, f"'{query}' 검색 결과 없음"
 
 
-def get_kakao_navi_route(start_lat, start_lon, end_lat, end_lon):
+def get_kakao_navi_route(start_lat, start_lon, end_lat, end_lon, priority="RECOMMEND"):
     try:
         kakao_api_key = st.secrets["KAKAO_API_KEY"]
     except Exception:
-        return None, None, "API Key 미설정"
+        return None, None, None, "API Key 미설정"
     url = "https://apis-navi.kakaomobility.com/v1/directions"
     headers = {"Authorization": f"KakaoAK {kakao_api_key}"}
     params = {
         "origin": f"{start_lon},{start_lat}",
         "destination": f"{end_lon},{end_lat}",
-        "priority": "RECOMMEND"
+        "priority": priority
     }
     response = requests.get(url, headers=headers, params=params)
     if response.status_code == 200:
         routes = response.json().get("routes", [])
         if routes:
             distance_meters = routes[0]["summary"]["distance"]
+            duration_seconds = routes[0]["summary"]["duration"]
+            duration_minutes = duration_seconds / 60
+            
             path_coords = []
             for section in routes[0].get("sections", []):
                 for road in section.get("roads", []):
                     vertexes = road.get("vertexes", [])
                     for i in range(0, len(vertexes), 2):
                         path_coords.append([vertexes[i + 1], vertexes[i]])
-            return distance_meters / 1000.0, path_coords, "성공"
-    return None, None, "길찾기 실패"
+            return distance_meters / 1000.0, duration_minutes, path_coords, "성공"
+    return None, None, None, "길찾기 실패"
 
 
 def get_weather(lat, lon):
@@ -147,6 +150,20 @@ with st.sidebar:
 
     current_soc = st.slider("현재 배터리 잔량 (%)", 0, 100, 80)
     base_efficiency = st.number_input("기준 전비 (km/kWh)", min_value=0.1, value=5.5, step=0.1)
+
+    st.divider()
+    st.markdown("📍 **주행 상세 설정**")
+    
+    # 1. 경로 타입 선택
+    route_priority = st.selectbox("경로 우선순위", ["RECOMMEND", "HIGHWAY", "ROAD"], 
+                                 format_func=lambda x: {"RECOMMEND": "추천 경로", "HIGHWAY": "고속도로 우선", "ROAD": "국도 우선"}[x])
+    
+    # 4. 계절 및 차량 설정 온도
+    import datetime
+    current_month = datetime.date.today().month
+    season = "여름" if 6 <= current_month <= 8 else "겨울" if current_month <= 2 or current_month >= 12 else "봄/가을"
+    st.info(f"현재 계절: {season}")
+    target_temp = st.slider("차량 설정 온도 (°C)", 18, 30, 22)
 
     st.divider()
     st.markdown("📍 **출발지 설정**")
@@ -177,10 +194,11 @@ start_temp, start_desc = get_weather(start_lat, start_lon)
 
 if end_lat:
     end_temp, end_desc = get_weather(end_lat, end_lon)
-    road_distance, path_coords, navi_status = get_kakao_navi_route(start_lat, start_lon, end_lat, end_lon)
+    # 경로 우선순위 반영
+    road_distance, travel_time, path_coords, navi_status = get_kakao_navi_route(start_lat, start_lon, end_lat, end_lon, priority=route_priority)
 else:
     end_temp, end_desc = (None, None)
-    road_distance, path_coords, navi_status = (None, None, "도착지 미확인")
+    road_distance, travel_time, path_coords, navi_status = (None, None, None, "도착지 미확인")
 
 # --- 메인 대시보드 (날씨 및 지도) ---
 st.subheader("🌍 실시간 환경 대시보드")
@@ -230,10 +248,30 @@ if st.button("🚀 경로 분석 및 배터리 잔량 계산하기", use_contain
     elif road_distance is None:
         st.error(f"❌ 경로를 찾을 수 없습니다. ({navi_status})")
     else:
+        # 전비 보정 (온도/계절 + 교통 + 경로)
         adjusted_efficiency = base_efficiency
-        if end_temp < 10:
-            penalty = (10 - end_temp) * 0.015
-            adjusted_efficiency = base_efficiency * (1 - penalty)
+        
+        # 1. 온도/계절 보정 (간단 모델)
+        temp_diff = abs(target_temp - end_temp)
+        if season == "겨울":
+            # 겨울엔 기온 낮으면 큰 페널티
+            penalty = (max(0, 20 - end_temp)) * 0.02 + (temp_diff * 0.005)
+            adjusted_efficiency *= (1 - penalty)
+        elif season == "여름":
+            # 여름엔 기온 높으면 페널티
+            penalty = (max(0, end_temp - 25)) * 0.01 + (temp_diff * 0.003)
+            adjusted_efficiency *= (1 - penalty)
+        
+        # 2. 교통 보정
+        avg_speed = road_distance / (travel_time / 60) if travel_time > 0 else 30
+        traffic_penalty = 0
+        if avg_speed < 30:
+            traffic_penalty = (30 - avg_speed) * 0.005
+            adjusted_efficiency *= (1 - traffic_penalty)
+            
+        # 3. 경로 타입 보정 (고속 위주면 공기저항 추가)
+        if route_priority == "HIGHWAY":
+            adjusted_efficiency *= 0.95  # 5% 감소
 
         current_energy = capacity * (current_soc / 100.0)
         consumed_energy = road_distance / adjusted_efficiency
@@ -242,16 +280,22 @@ if st.button("🚀 경로 분석 및 배터리 잔량 계산하기", use_contain
 
         st.subheader("📊 주행 시뮬레이션 결과")
 
-        res_col1, res_col2, res_col3 = st.columns(3)
+        res_col1, res_col2, res_col3, res_col4 = st.columns(4)
         with res_col1:
             st.metric("도착 예상 잔량", f"{remaining_soc:.1f}%", delta=f"{remaining_soc - current_soc:.1f}%")
         with res_col2:
-            st.metric("실제 도로 주행 거리", f"{road_distance:.1f} km")
+            st.metric("주행 거리", f"{road_distance:.1f} km")
         with res_col3:
-            st.metric("도착지 적용 전비", f"{adjusted_efficiency:.2f} km/kWh")
+            st.metric("예상 소요 시간", f"{int(travel_time)} 분")
+        with res_col4:
+            st.metric("적용 전비", f"{adjusted_efficiency:.2f} km/kWh")
 
-        if end_temp < 10:
-            st.warning(f"❄️ 목적지 기온이 낮아({end_temp}°C) 배터리 효율이 {adjusted_efficiency:.2f}km/kWh로 하향 보정되었습니다.")
+        if season != "봄/가을":
+            st.warning(f"🌡️ 계절/온도 보정: {season}, 설정온도 {target_temp}°C")
+        if traffic_penalty > 0:
+            st.warning(f"🚗 교통 정체 보정: 평균 {int(avg_speed)}km/h로 운행")
+        if route_priority == "HIGHWAY":
+            st.warning("🛣️ 고속도로 주행: 공기 저항 보정 적용")
 
         if remaining_soc < 20:
             st.error("⚠️ 도착 잔량이 20% 미만입니다! 중간 충전소를 반드시 확인하세요.")
