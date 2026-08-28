@@ -168,6 +168,25 @@ with st.sidebar:
     st.divider()
     st.markdown("📍 **출발지 설정**")
 
+    # Geolocation 컴포넌트의 버튼을 글씨/텍스트 스타일로 커스텀하기 위한 CSS 주입
+    st.markdown("""
+        <style>
+        /* streamlit_geolocation iframe 내부의 버튼 스타일 제어 시도 및 상위 레이아웃 보완 */
+        div[data-testid="stMarkdownContainer"] + div iframe {
+            border: none !important;
+        }
+        /* 현재 위치 파악 텍스트 안내 추가 */
+        .gps-label {
+            font-size: 14px;
+            color: #0068C9;
+            font-weight: bold;
+            margin-bottom: 5px;
+            display: inline-block;
+        }
+        </style>
+        <span class="gps-label">📲 아래 [Get Location] 버튼을 클릭해 현재 위치를 파악하세요:</span>
+    """, unsafe_allow_html=True)
+
     loc = streamlit_geolocation()
     manual_start = st.text_input("출발지 직접 입력 (GPS 미작동 시)", value="")
 
@@ -177,7 +196,7 @@ with st.sidebar:
     if loc and loc.get('latitude') and loc.get('longitude'):
         start_lat, start_lon = loc['latitude'], loc['longitude']
         start_address_name = get_address_from_coords(start_lat, start_lon)
-        st.success(f"GPS 위치: {start_address_name}")
+        st.success(f"📍 파악된 현재 위치: {start_address_name}")
     elif manual_start.strip() != "":
         s_lat, s_lon, s_status = get_coordinates_from_kakao(manual_start)
         if s_lat:
@@ -186,16 +205,45 @@ with st.sidebar:
             st.info(f"입력된 출발지: {start_address_name}")
 
     st.divider()
-    destination_address = st.text_input("도착지 (상호명 또는 주소)", value="투윤커피")
+    st.markdown("📍 **도착지 설정**")
+    
+    # 세션 상태로 검색 결과 캐싱하여 불필요한 반복 호출 방지 및 로딩 흐름 제어
+    if "dest_search_query" not in st.session_state:
+        st.session_state.dest_search_query = "투윤커피"
+    if "dest_lat" not in st.session_state:
+        st.session_state.dest_lat = None
+    if "dest_lon" not in st.session_state:
+        st.session_state.dest_lon = None
+    if "dest_status" not in st.session_state:
+        st.session_state.dest_status = "도착지 미확인"
+
+    destination_address = st.text_input("도착지 (상호명 또는 주소)", value=st.session_state.dest_search_query)
+    
+    # 도착지 검색 버튼
+    if st.button("🔍 도착지 검색", use_container_width=True) or st.session_state.dest_lat is None:
+        st.session_state.dest_search_query = destination_address
+        with st.spinner("🔄 주소지를 검색 중입니다..."):
+            d_lat, d_lon, d_status = get_coordinates_from_kakao(destination_address)
+            st.session_state.dest_lat = d_lat
+            st.session_state.dest_lon = d_lon
+            st.session_state.dest_status = d_status
+            if d_lat:
+                st.toast(f"✅ 검색 완료: {d_status}")
+            else:
+                st.error(f"❌ 검색 실패: {d_status}")
+
+    end_lat = st.session_state.dest_lat
+    end_lon = st.session_state.dest_lon
+    end_status = st.session_state.dest_status
 
 # --- 백그라운드 데이터 처리 ---
-end_lat, end_lon, end_status = get_coordinates_from_kakao(destination_address)
 start_temp, start_desc = get_weather(start_lat, start_lon)
 
 if end_lat:
     end_temp, end_desc = get_weather(end_lat, end_lon)
     # 경로 우선순위 반영
-    road_distance, travel_time, path_coords, navi_status = get_kakao_navi_route(start_lat, start_lon, end_lat, end_lon, priority=route_priority)
+    with st.spinner("🛣️ 실시간 경로를 분석 중입니다..."):
+        road_distance, travel_time, path_coords, navi_status = get_kakao_navi_route(start_lat, start_lon, end_lat, end_lon, priority=route_priority)
 else:
     end_temp, end_desc = (None, None)
     road_distance, travel_time, path_coords, navi_status = (None, None, None, "도착지 미확인")
