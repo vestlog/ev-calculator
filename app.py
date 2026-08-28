@@ -3,6 +3,7 @@ import requests
 import folium
 from streamlit_folium import st_folium
 from streamlit_geolocation import streamlit_geolocation
+import xmltodict  # XML 파싱을 위해 추가
 
 # 페이지 설정
 st.set_page_config(page_title="스마트 EV 전비 계산기", page_icon="⚡", layout="wide")
@@ -43,14 +44,58 @@ st.markdown("""
 st.title("⚡ 지능형 전기차 도착 잔량 계산기")
 st.markdown("카카오 내비게이션 실시간 경로와 날씨를 연동하여 정확한 잔량을 예측합니다.")
 
-# 1. 전기차 모델 데이터 설정
-ev_models = {
-    "BMW i4 eDrive40": 80.7,
-    "현대 아이오닉5 (롱레인지)": 84.0,
-    "기아 EV6 (롱레인지)": 77.4,
-    "테슬라 모델3 (롱레인지)": 75.0,
-    "테슬라 모델Y (롱레인지)": 75.0
-}
+# 1. 전기차 모델 데이터 설정 (공공데이터 API 연동 - 인증정보 활용)
+@st.cache_data(ttl=86400) # 24시간마다 캐시 갱신
+def get_ev_models_with_specs(gubun="1", certiDate="2023"):
+    try:
+        api_key = st.secrets["PUBLIC_DATA_API_KEY"]
+        base_url = "https://apis.data.go.kr/1480523/KencisEV/getEVCert"
+        url = f"{base_url}?serviceKey={api_key}&pageNo=1&numOfRows=100&resultType=XML&gubun={gubun}&certiDate={certiDate}"
+
+        response = requests.get(url)
+        if response.status_code == 200:
+            data_dict = xmltodict.parse(response.text)
+            items = data_dict.get("response", {}).get("body", {}).get("items", {}).get("item", [])
+            if isinstance(items, dict): items = [items]
+
+            # {제조사: {모델명: {상온전비: ..., 저온전비: ...}}} 구조
+            ev_data = {}
+            for item in items:
+                brand = item.get("officenm", "기타").split(' ')[0]
+                model_name = item["vehnm"]
+                # 상온 복합(dstchrrdistrtempcpx) / 저온 복합(dstchrrdistlowtmpcpx)
+                norm_range = float(item["dstchrrdistrtempcpx"]) if item["dstchrrdistrtempcpx"] != "-" else 300.0
+                low_range = float(item["dstchrrdistlowtmpcpx"]) if item["dstchrrdistlowtmpcpx"] != "-" else 200.0
+
+                if brand not in ev_data: ev_data[brand] = {}
+                ev_data[brand][model_name] = {"norm_range": norm_range, "low_range": low_range}
+            return ev_data
+    except Exception as e:
+        st.error(f"API 호출 오류: {e}")
+    return {"기본": {"BMW i4": {"norm_range": 350.0, "low_range": 250.0}}}
+
+# ... (UI 레이아웃 일부 유지)
+
+    # 모델 선택
+    models_dict = ev_data[selected_brand]
+    selected_model = st.selectbox("모델 선택", list(models_dict.keys()))
+
+    # 선택된 모델의 상세 정보
+    specs = models_dict[selected_model]
+
+    # 현재 계절에 따른 기본 주행거리 설정
+    import datetime
+    current_month = datetime.date.today().month
+    season = "여름" if 6 <= current_month <= 8 else "겨울" if current_month <= 2 or current_month >= 12 else "봄/가을"
+
+    # 겨울이면 저온 주행거리 사용, 그 외는 상온 주행거리 사용
+    base_range = specs["low_range"] if season == "겨울" else specs["norm_range"]
+
+    current_soc = st.slider("현재 배터리 잔량 (%)", 0, 100, 80)
+
+    # 상온 주행거리 기준 전비 입력 (사용자 수정 가능)
+    base_efficiency = st.number_input("기준 주행가능거리 (km)", min_value=100.0, value=float(base_range), step=1.0)
+
 
 
 # --- API 연동 함수들 ---
@@ -145,11 +190,34 @@ def get_weather(lat, lon):
 # --- UI 레이아웃 시작 ---
 with st.sidebar:
     st.header("⚙️ 주행 설정")
-    selected_model = st.selectbox("전기차 모델 선택", list(ev_models.keys()))
-    capacity = ev_models[selected_model]
-
+    
+    # API 호출 파라미터 설정
+    gubun_map = {"수입차": "1", "국내차": "2"}
+    selected_gubun_name = st.radio("차량 분류", list(gubun_map.keys()))
+    selected_gubun = gubun_map[selected_gubun_name]
+    selected_year = st.text_input("제조년도", value="2022")
+    
+    # 데이터 가져오기
+    ev_data = get_ev_models_with_specs(gubun=selected_gubun, certiDate=selected_year)
+    
+    # 2단계 모델 선택 UI
+    brands = sorted(list(ev_data.keys()))
+    selected_brand = st.selectbox("제조사 선택", brands)
+    
+    models_dict = ev_data[selected_brand]
+    selected_model = st.selectbox("모델 선택", list(models_dict.keys()))
+    
+    # 선택된 모델의 상세 정보
+    specs = models_dict[selected_model]
+    
+    # 배터리 용량은 데이터가 없으므로 임시 기본값 사용
+    capacity = 75.0 
+    
+    # 모델명 일부 매칭을 통한 전비 검색 (API 데이터 활용)
+    default_eff = specs.get("norm_range", 300.0) / 60.0 # 임시로 주행거리를 기반으로 전비 근사
+            
     current_soc = st.slider("현재 배터리 잔량 (%)", 0, 100, 80)
-    base_efficiency = st.number_input("기준 전비 (km/kWh)", min_value=0.1, value=5.5, step=0.1)
+    base_efficiency = st.number_input("기준 전비 (km/kWh)", min_value=0.1, value=default_eff, step=0.1)
 
     st.divider()
     st.markdown("📍 **주행 상세 설정**")
@@ -184,7 +252,7 @@ with st.sidebar:
             display: inline-block;
         }
         </style>
-        <span class="gps-label">📲 아래 [Get Location] 버튼을 클릭해 현재 위치를 파악하세요:</span>
+        <span class="gps-label">🎯 아래 GPS 목표 아이콘을 클릭해 현재 위치를 파악하세요:</span>
     """, unsafe_allow_html=True)
 
     loc = streamlit_geolocation()
@@ -297,34 +365,35 @@ if st.button("🚀 경로 분석 및 배터리 잔량 계산하기", use_contain
         st.error(f"❌ 경로를 찾을 수 없습니다. ({navi_status})")
     else:
         # 전비 보정 (온도/계절 + 교통 + 경로)
-        adjusted_efficiency = base_efficiency
+        # base_efficiency는 이제 상온 주행가능거리(km)입니다.
+        adjusted_range = base_efficiency
         
         # 1. 온도/계절 보정 (간단 모델)
         temp_diff = abs(target_temp - end_temp)
         if season == "겨울":
             # 겨울엔 기온 낮으면 큰 페널티
             penalty = (max(0, 20 - end_temp)) * 0.02 + (temp_diff * 0.005)
-            adjusted_efficiency *= (1 - penalty)
+            adjusted_range *= (1 - penalty)
         elif season == "여름":
             # 여름엔 기온 높으면 페널티
             penalty = (max(0, end_temp - 25)) * 0.01 + (temp_diff * 0.003)
-            adjusted_efficiency *= (1 - penalty)
+            adjusted_range *= (1 - penalty)
         
         # 2. 교통 보정
         avg_speed = road_distance / (travel_time / 60) if travel_time > 0 else 30
         traffic_penalty = 0
         if avg_speed < 30:
             traffic_penalty = (30 - avg_speed) * 0.005
-            adjusted_efficiency *= (1 - traffic_penalty)
+            adjusted_range *= (1 - traffic_penalty)
             
         # 3. 경로 타입 보정 (고속 위주면 공기저항 추가)
         if route_priority == "HIGHWAY":
-            adjusted_efficiency *= 0.95  # 5% 감소
+            adjusted_range *= 0.95  # 5% 감소
 
-        current_energy = capacity * (current_soc / 100.0)
-        consumed_energy = road_distance / adjusted_efficiency
-        remaining_energy = current_energy - consumed_energy
-        remaining_soc = max((remaining_energy / capacity) * 100.0, 0.0)
+        # 거리 기반 잔량 계산
+        # 남은 잔량(%) = 현재_잔량(%) - (주행거리 / 보정된_주행가능거리 * 100)
+        consumed_soc = (road_distance / adjusted_range) * 100.0
+        remaining_soc = max(current_soc - consumed_soc, 0.0)
 
         st.subheader("📊 주행 시뮬레이션 결과")
 
@@ -336,7 +405,7 @@ if st.button("🚀 경로 분석 및 배터리 잔량 계산하기", use_contain
         with res_col3:
             st.metric("예상 소요 시간", f"{int(travel_time)} 분")
         with res_col4:
-            st.metric("적용 전비", f"{adjusted_efficiency:.2f} km/kWh")
+            st.metric("보정 주행가능거리", f"{adjusted_range:.1f} km")
 
         if season != "봄/가을":
             st.warning(f"🌡️ 계절/온도 보정: {season}, 설정온도 {target_temp}°C")
