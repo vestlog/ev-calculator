@@ -3,10 +3,14 @@ import requests
 import folium
 from streamlit_folium import st_folium
 from streamlit_geolocation import streamlit_geolocation
-import xmltodict  # XML 파싱을 위해 추가
+import xmltodict
+from streamlit_cookies_controller import CookieController
 
 # 페이지 설정
 st.set_page_config(page_title="스마트 EV 전비 계산기", page_icon="⚡", layout="wide")
+
+# 쿠키 컨트롤러 초기화
+controller = CookieController()
 
 # 아이폰 사파리 키보드 자동 확대 방지 및 모바일 반응형 CSS
 st.markdown("""
@@ -191,33 +195,71 @@ def get_weather(lat, lon):
 with st.sidebar:
     st.header("⚙️ 주행 설정")
     
+    # 저장된 설정 불러오기
+    saved_config = controller.get_all()
+    
     # API 호출 파라미터 설정
     gubun_map = {"수입차": "1", "국내차": "2"}
-    selected_gubun_name = st.radio("차량 분류", list(gubun_map.keys()))
+    
+    # 쿠키에서 설정값 로드
+    def_gubun = saved_config.get("gubun", "수입차")
+    def_year = saved_config.get("year", "2023")
+    
+    selected_gubun_name = st.radio("차량 분류", list(gubun_map.keys()), index=list(gubun_map.keys()).index(def_gubun))
     selected_gubun = gubun_map[selected_gubun_name]
-    selected_year = st.text_input("제조년도", value="2022")
+    selected_year = st.text_input("제조년도", value=def_year)
     
     # 데이터 가져오기
     ev_data = get_ev_models_with_specs(gubun=selected_gubun, certiDate=selected_year)
     
+    # 세션 상태 초기화 및 쿠키 연동
+    if "selected_brand" not in st.session_state:
+        st.session_state.selected_brand = saved_config.get("brand", sorted(list(ev_data.keys()))[0])
+    if "selected_model" not in st.session_state:
+        st.session_state.selected_model = saved_config.get("model", list(ev_data[st.session_state.selected_brand].keys())[0])
+    if "base_efficiency" not in st.session_state:
+        st.session_state.base_efficiency = float(saved_config.get("efficiency", 5.0))
+        
+    def update_model():
+        st.session_state.selected_model = st.session_state.model_selector
+        specs = ev_data[st.session_state.selected_brand][st.session_state.selected_model]
+        st.session_state.base_efficiency = specs.get("norm_range", 300.0) / 60.0
+        # 설정 저장
+        controller.set("gubun", selected_gubun_name)
+        controller.set("year", selected_year)
+        controller.set("brand", st.session_state.selected_brand)
+        controller.set("model", st.session_state.selected_model)
+        controller.set("efficiency", st.session_state.base_efficiency)
+
+    def update_brand():
+        st.session_state.selected_brand = st.session_state.brand_selector
+        # 브랜드 변경 시 모델을 해당 브랜드의 첫 번째 모델로 초기화
+        st.session_state.selected_model = list(ev_data[st.session_state.selected_brand].keys())[0]
+        specs = ev_data[st.session_state.selected_brand][st.session_state.selected_model]
+        st.session_state.base_efficiency = specs.get("norm_range", 300.0) / 60.0
+        # 설정 저장
+        controller.set("brand", st.session_state.selected_brand)
+        controller.set("model", st.session_state.selected_model)
+        controller.set("efficiency", st.session_state.base_efficiency)
+
     # 2단계 모델 선택 UI
     brands = sorted(list(ev_data.keys()))
-    selected_brand = st.selectbox("제조사 선택", brands)
+    # 브랜드가 유효한지 확인
+    brand_index = brands.index(st.session_state.selected_brand) if st.session_state.selected_brand in brands else 0
+    st.selectbox("제조사 선택", brands, key="brand_selector", index=brand_index, on_change=update_brand)
     
-    models_dict = ev_data[selected_brand]
-    selected_model = st.selectbox("모델 선택", list(models_dict.keys()))
+    models_dict = ev_data[st.session_state.selected_brand]
     
-    # 선택된 모델의 상세 정보
-    specs = models_dict[selected_model]
+    # 모델 셀렉터 인덱스 관리
+    model_list = list(models_dict.keys())
+    model_index = model_list.index(st.session_state.selected_model) if st.session_state.selected_model in model_list else 0
+    st.selectbox("모델 선택", model_list, key="model_selector", index=model_index, on_change=update_model)
     
     # 배터리 용량은 데이터가 없으므로 임시 기본값 사용
     capacity = 75.0 
     
-    # 모델명 일부 매칭을 통한 전비 검색 (API 데이터 활용)
-    default_eff = specs.get("norm_range", 300.0) / 60.0 # 임시로 주행거리를 기반으로 전비 근사
-            
     current_soc = st.slider("현재 배터리 잔량 (%)", 0, 100, 80)
-    base_efficiency = st.number_input("기준 전비 (km/kWh)", min_value=0.1, value=default_eff, step=0.1)
+    base_efficiency = st.number_input("기준 전비 (km/kWh)", min_value=0.1, value=st.session_state.base_efficiency, step=0.1)
 
     st.divider()
     st.markdown("📍 **주행 상세 설정**")
