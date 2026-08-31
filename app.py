@@ -195,8 +195,8 @@ def get_weather(lat, lon):
 with st.sidebar:
     st.header("⚙️ 주행 설정")
     
-    # 저장된 설정 불러오기
-    saved_config = controller.get_all()
+    # 저장된 설정 불러오기 (getAll 사용)
+    saved_config = controller.getAll()
     
     # API 호출 파라미터 설정
     gubun_map = {"수입차": "1", "국내차": "2"}
@@ -263,12 +263,66 @@ with st.sidebar:
 
     st.divider()
     st.markdown("📍 **주행 상세 설정**")
-    
+
     # 1. 경로 타입 선택
     route_priority = st.selectbox("경로 우선순위", ["RECOMMEND", "HIGHWAY", "ROAD"], 
                                  format_func=lambda x: {"RECOMMEND": "추천 경로", "HIGHWAY": "고속도로 우선", "ROAD": "국도 우선"}[x])
+
+    # ... (생략된 기존 UI 요소들) ...
+
+# --- 유튜브 채널 최신 영상 가져오기 함수 ---
+@st.cache_data(ttl=3600) # 1시간마다 갱신
+def get_latest_youtube_video(channel_id):
+    try:
+        api_key = st.secrets["YOUTUBE_API_KEY"]
+        import re
+        
+        def parse_duration(duration):
+            # ISO 8601 형식: PT1H2M30S 또는 PT55S
+            hours = re.search(r'(\d+)H', duration)
+            minutes = re.search(r'(\d+)M', duration)
+            seconds = re.search(r'(\d+)S', duration)
+            h = int(hours.group(1)) if hours else 0
+            m = int(minutes.group(1)) if minutes else 0
+            s = int(seconds.group(1)) if seconds else 0
+            return h * 3600 + m * 60 + s
+
+        # 1. 채널의 업로드 영상 목록(재생목록 ID) 가져오기
+        url = f"https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id={channel_id}&key={api_key}"
+        res = requests.get(url).json()
+        playlist_id = res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+        
+        # 2. 최근 영상 10개 가져오기
+        url = f"https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=10&playlistId={playlist_id}&key={api_key}"
+        res = requests.get(url).json()
+        video_ids = [item['snippet']['resourceId']['videoId'] for item in res['items']]
+        
+        # 3. 각 영상의 길이 확인 (Shorts 필터링)
+        url = f"https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id={','.join(video_ids)}&key={api_key}"
+        res = requests.get(url).json()
+        
+        for item in res['items']:
+            if parse_duration(item['contentDetails']['duration']) > 60:
+                return item['id']
+                
+    except Exception as e:
+        return None
+    return None
+
+# --- UI 레이아웃 시작 ---
+with st.sidebar:
+    # ... (생략) ...
     
-    # 4. 계절 및 차량 설정 온도
+    # AI 음악 채널 배너 (사이드바 하단)
+    st.divider()
+    st.subheader("🎵 AI 음악 채널 (최신곡)")
+    channel_id = st.secrets.get("YOUTUBE_CHANNEL_ID", "YOUR_CHANNEL_ID")
+    video_id = get_latest_youtube_video(channel_id)
+    if video_id:
+        st.video(f"https://www.youtube.com/watch?v={video_id}", autoplay=True, muted=True)
+    else:
+        st.error("최신 일반 영상을 가져오는데 실패했습니다.")
+
     import datetime
     current_month = datetime.date.today().month
     season = "여름" if 6 <= current_month <= 8 else "겨울" if current_month <= 2 or current_month >= 12 else "봄/가을"
